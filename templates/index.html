@@ -670,7 +670,8 @@
                             this.closeAuthModal();
                             await this.fetchAccounts(); 
                         } else {
-                            this.tokenError = 'Gagal: Token Invalid atau Expired.';
+                            const errData = await res.json().catch(() => ({}));
+                            this.tokenError = errData.detail || 'Gagal: Token Invalid atau Expired.';
                         }
                     } finally {
                         this.isConnecting = false;

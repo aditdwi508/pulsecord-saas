@@ -325,8 +325,8 @@ async def get_all_accounts(db: Session = Depends(get_db)):
 async def connect_manual_token(payload: ManualTokenPayload, db: Session = Depends(get_db)):
     try:
         profile = await fetch_user_profile(payload.token)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Token Invalid atau Expired")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e) or "Token Invalid atau Expired")
 
     acct = db.query(DiscordAccount).filter(DiscordAccount.discord_id == profile["discord_id"]).first()
     if not acct:
