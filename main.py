@@ -1,10 +1,12 @@
 import asyncio
+import base64
 import os
 import random
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import FastAPI, Depends, Request, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
@@ -47,8 +49,41 @@ if "schedules" in inspector.get_table_names():
 app = FastAPI(title="PulseCord SaaS Multi-Account")
 templates = Jinja2Templates(directory="templates")
 
+
+@app.middleware("http")
+async def basic_auth_guard(request: Request, call_next):
+    # Biarkan endpoint cron berjalan memakai CRON_SECRET tanpa terhalang Basic Auth
+    if request.url.path == "/api/cron/tick":
+        return await call_next(request)
+
+    admin_user = os.getenv("DASHBOARD_USER", "admin")
+    admin_pass = os.getenv("DASHBOARD_PASSWORD", "")
+
+    # Jika DASHBOARD_PASSWORD diisi di Vercel, wajibkan login
+    if admin_pass:
+        auth_header = request.headers.get("Authorization", "")
+        is_valid = False
+        if auth_header.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+                user_in, pass_in = decoded.split(":", 1)
+                is_valid = secrets.compare_digest(user_in, admin_user) and secrets.compare_digest(pass_in, admin_pass)
+            except Exception:
+                is_valid = False
+
+        if not is_valid:
+            return Response(
+                content="Akses Ditolak: Masukkan Username & Password PulseCord.",
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="PulseCord Private Area"'},
+            )
+
+    return await call_next(request)
+
+
 class ManualTokenPayload(BaseModel):
     token: str
+
 
 class AutomationStartPayload(BaseModel):
     channels: list
@@ -57,17 +92,20 @@ class AutomationStartPayload(BaseModel):
     max_delay: int = 1830
     auto_delete: bool = True
 
+
 class ChannelControlPayload(BaseModel):
     message_content: str = ""
     min_delay: int = 1800
     max_delay: int = 1830
     auto_delete: bool = True
 
+
 def _format_duration(seconds: int) -> str:
     jam = seconds // 3600
     menit = (seconds % 3600) // 60
     detik = seconds % 60
     return f"{jam}j {menit}m {detik}d" if jam > 0 else f"{menit}m {detik}d"
+
 
 def _enrich_channels_with_cd(channels: list, acct_status: str, fallback_msg: str = "", fallback_min: int = 1800, fallback_max: int = 1830, fallback_del: bool = True) -> list:
     now = datetime.now()
@@ -96,6 +134,7 @@ def _enrich_channels_with_cd(channels: list, acct_status: str, fallback_msg: str
         item["next_run_time"] = next_time_str
         enriched.append(item)
     return enriched
+
 
 def _merge_channel_configs(old_channels: list, new_channels: list, force_status: Optional[str] = None) -> list:
     old_map = {c["id"]: c for c in (old_channels or [])}
@@ -134,6 +173,7 @@ def _merge_channel_configs(old_channels: list, new_channels: list, force_status:
         merged.append(item)
     return merged
 
+
 def _sync_schedule_summary(sched: Schedule):
     channels = sched.target_channels or []
     running_list = [c for c in channels if c.get("status") == "Running"]
@@ -147,9 +187,11 @@ def _sync_schedule_summary(sched: Schedule):
                 pass
     sched.next_run_at = min(upcoming) if upcoming else None
 
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
+
 
 # ENDPOINT PENGGANTI WORKER.PY UNTUK VERCEL CRON
 @app.api_route("/api/cron/tick", methods=["GET", "POST"])
@@ -281,6 +323,7 @@ async def run_serverless_worker_tick(secret: str = "", db: Session = Depends(get
 
     return {"status": "ok", "processed": processed_count, "time": now.strftime("%H:%M:%S")}
 
+
 @app.get("/api/accounts")
 async def get_all_accounts(db: Session = Depends(get_db)):
     accounts = db.query(DiscordAccount).all()
@@ -321,6 +364,7 @@ async def get_all_accounts(db: Session = Depends(get_db)):
         })
     return results
 
+
 @app.post("/api/accounts/connect/manual")
 async def connect_manual_token(payload: ManualTokenPayload, db: Session = Depends(get_db)):
     try:
@@ -348,6 +392,7 @@ async def connect_manual_token(payload: ManualTokenPayload, db: Session = Depend
         
     return {"message": "Account added successfully"}
 
+
 @app.delete("/api/accounts/{account_id}")
 async def delete_account(account_id: int, db: Session = Depends(get_db)):
     acct = db.query(DiscordAccount).filter(DiscordAccount.id == account_id).first()
@@ -356,26 +401,33 @@ async def delete_account(account_id: int, db: Session = Depends(get_db)):
         db.commit()
     return {"status": "Deleted"}
 
+
 @app.get("/api/discord/{account_id}/guilds")
 async def get_guilds(account_id: int, db: Session = Depends(get_db)):
     acct = db.query(DiscordAccount).filter(DiscordAccount.id == account_id).first()
-    if not acct: raise HTTPException(status_code=404)
+    if not acct:
+        raise HTTPException(status_code=404)
     return await fetch_joined_guilds(decrypt_token(acct.encrypted_token))
+
 
 @app.get("/api/discord/{account_id}/guilds/{guild_id}/channels")
 async def get_channels(account_id: int, guild_id: str, guild_name: str = "", db: Session = Depends(get_db)):
     acct = db.query(DiscordAccount).filter(DiscordAccount.id == account_id).first()
-    if not acct: raise HTTPException(status_code=404)
+    if not acct:
+        raise HTTPException(status_code=404)
     return await fetch_guild_text_channels(decrypt_token(acct.encrypted_token), guild_id, guild_name)
+
 
 @app.get("/api/discord/{account_id}/channels/{channel_id}")
 async def get_single_channel(account_id: int, channel_id: str, guild_name: str = "Custom Target", db: Session = Depends(get_db)):
     acct = db.query(DiscordAccount).filter(DiscordAccount.id == account_id).first()
-    if not acct: raise HTTPException(status_code=404)
+    if not acct:
+        raise HTTPException(status_code=404)
     try:
         return await fetch_single_channel(decrypt_token(acct.encrypted_token), channel_id, guild_name)
     except Exception:
         raise HTTPException(status_code=404)
+
 
 @app.get("/api/automation/{account_id}")
 async def get_schedule(account_id: int, db: Session = Depends(get_db)):
@@ -417,6 +469,7 @@ async def get_schedule(account_id: int, db: Session = Depends(get_db)):
         ]
     }
 
+
 @app.post("/api/automation/{account_id}/save")
 async def save_draft(account_id: int, payload: AutomationStartPayload, db: Session = Depends(get_db)):
     sched = db.query(Schedule).filter(Schedule.account_id == account_id).first()
@@ -429,24 +482,90 @@ async def save_draft(account_id: int, payload: AutomationStartPayload, db: Sessi
     db.commit()
     return {"status": "Saved"}
 
+
 @app.post("/api/automation/{account_id}/channels/{channel_id}/start")
 async def start_single_channel(account_id: int, channel_id: str, payload: ChannelControlPayload, db: Session = Depends(get_db)):
+    acct = db.query(DiscordAccount).filter(DiscordAccount.id == account_id).first()
     sched = db.query(Schedule).filter(Schedule.account_id == account_id).first()
-    if not sched:
+    if not acct or not sched:
         raise HTTPException(status_code=404)
 
+    token = decrypt_token(acct.encrypted_token)
     updated = []
+
     for ch in (sched.target_channels or []):
         item = dict(ch)
         if item["id"] == channel_id:
             min_d = max(15, int(payload.min_delay))
             max_d = max(min_d + 5, int(payload.max_delay))
-            item["message_content"] = payload.message_content
+            msg_content = (payload.message_content or "").strip()
+
+            item["message_content"] = msg_content
             item["min_delay"] = min_d
             item["max_delay"] = max_d
             item["auto_delete"] = payload.auto_delete
             item["status"] = "Running"
             item.pop("next_run_at", None)
+
+            ch_name = item.get("name", channel_id)
+            guild_name = item.get("guild_name", "Server")
+            label = f"#{ch_name} ({guild_name})"
+
+            if msg_content:
+                if payload.auto_delete and item.get("last_message_id"):
+                    try:
+                        await delete_channel_message(token, channel_id, item["last_message_id"])
+                        db.add(MessageLog(
+                            account_id=acct.id,
+                            log_type="DELETED",
+                            channel_label=label,
+                            detail="Pesan sebelumnya dihapus."
+                        ))
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.5)
+
+                try:
+                    msg_id = await send_channel_message(token, channel_id, msg_content)
+                    sent_now = datetime.now()
+                    delay = random.randint(min_d, max_d)
+                    next_time = sent_now + timedelta(seconds=delay)
+
+                    item["last_message_id"] = msg_id
+                    item["last_sent_at"] = sent_now.isoformat()
+                    item["next_run_at"] = next_time.isoformat()
+                    sched.last_sent_at = sent_now
+
+                    db.add(MessageLog(
+                        account_id=acct.id,
+                        log_type="SENT",
+                        channel_label=label,
+                        detail=f"Terkirim: \"{msg_content[:45]}{'...' if len(msg_content) > 45 else ''}\""
+                    ))
+                    db.add(MessageLog(
+                        account_id=acct.id,
+                        log_type="SLEEP",
+                        channel_label=label,
+                        detail=f"CD {_format_duration(delay)} (kirim lagi pukul {next_time.strftime('%H:%M:%S')})."
+                    ))
+                except DiscordRateLimitError as rl:
+                    retry_time = datetime.now() + timedelta(seconds=rl.retry_after)
+                    item["next_run_at"] = retry_time.isoformat()
+                    db.add(MessageLog(
+                        account_id=acct.id,
+                        log_type="SLEEP",
+                        channel_label=label,
+                        detail=f"Slowmode Discord aktif: tunggu {_format_duration(rl.retry_after)}."
+                    ))
+                except Exception as e:
+                    item["status"] = "Paused"
+                    db.add(MessageLog(
+                        account_id=acct.id,
+                        log_type="ERROR",
+                        channel_label=label,
+                        detail=str(e)
+                    ))
+
         updated.append(item)
 
     sched.target_channels = updated
@@ -454,6 +573,7 @@ async def start_single_channel(account_id: int, channel_id: str, payload: Channe
     flag_modified(sched, "target_channels")
     db.commit()
     return {"status": "Running"}
+
 
 @app.post("/api/automation/{account_id}/channels/{channel_id}/stop")
 async def stop_single_channel(account_id: int, channel_id: str, payload: Optional[ChannelControlPayload] = None, db: Session = Depends(get_db)):
@@ -482,6 +602,7 @@ async def stop_single_channel(account_id: int, channel_id: str, payload: Optiona
     db.commit()
     return {"status": "Paused"}
 
+
 @app.post("/api/automation/{account_id}/stop-all")
 async def stop_all_channels(account_id: int, payload: Optional[AutomationStartPayload] = None, db: Session = Depends(get_db)):
     sched = db.query(Schedule).filter(Schedule.account_id == account_id).first()
@@ -492,6 +613,7 @@ async def stop_all_channels(account_id: int, payload: Optional[AutomationStartPa
         flag_modified(sched, "target_channels")
         db.commit()
     return {"status": "Paused"}
+
 
 @app.get("/api/logs")
 async def get_global_logs(account_id: Optional[int] = None, db: Session = Depends(get_db)):
@@ -513,6 +635,7 @@ async def get_global_logs(account_id: Optional[int] = None, db: Session = Depend
         }
         for l in logs
     ]
+
 
 @app.delete("/api/logs")
 async def clear_global_logs(account_id: Optional[int] = None, db: Session = Depends(get_db)):
