@@ -1,4 +1,7 @@
-from datetime import datetime
+import asyncio
+import os
+import random
+from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import FastAPI, Depends, Request, HTTPException
 from fastapi.responses import HTMLResponse
@@ -16,11 +19,14 @@ from app.discord_api import (
     fetch_joined_guilds,
     fetch_guild_text_channels,
     fetch_single_channel,
+    send_channel_message,
+    delete_channel_message,
+    DiscordRateLimitError,
 )
 
 Base.metadata.create_all(bind=engine)
 
-# AUTO-MIGRATE kolom baru tanpa menghapus database lama
+# AUTO-MIGRATE kolom baru
 inspector = inspect(engine)
 if "message_logs" in inspector.get_table_names():
     log_cols = [c["name"] for c in inspector.get_columns("message_logs")]
@@ -34,9 +40,9 @@ if "schedules" in inspector.get_table_names():
         if "account_id" not in sched_cols:
             conn.execute(text("ALTER TABLE schedules ADD COLUMN account_id INTEGER"))
         if "last_sent_at" not in sched_cols:
-            conn.execute(text("ALTER TABLE schedules ADD COLUMN last_sent_at DATETIME"))
+            conn.execute(text("ALTER TABLE schedules ADD COLUMN last_sent_at TIMESTAMP"))
         if "next_run_at" not in sched_cols:
-            conn.execute(text("ALTER TABLE schedules ADD COLUMN next_run_at DATETIME"))
+            conn.execute(text("ALTER TABLE schedules ADD COLUMN next_run_at TIMESTAMP"))
 
 app = FastAPI(title="PulseCord SaaS Multi-Account")
 templates = Jinja2Templates(directory="templates")
@@ -56,6 +62,12 @@ class ChannelControlPayload(BaseModel):
     min_delay: int = 1800
     max_delay: int = 1830
     auto_delete: bool = True
+
+def _format_duration(seconds: int) -> str:
+    jam = seconds // 3600
+    menit = (seconds % 3600) // 60
+    detik = seconds % 60
+    return f"{jam}j {menit}m {detik}d" if jam > 0 else f"{menit}m {detik}d"
 
 def _enrich_channels_with_cd(channels: list, acct_status: str, fallback_msg: str = "", fallback_min: int = 1800, fallback_max: int = 1830, fallback_del: bool = True) -> list:
     now = datetime.now()
@@ -99,7 +111,6 @@ def _merge_channel_configs(old_channels: list, new_channels: list, force_status:
         item["auto_delete"] = True if item.get("auto_delete") is None else bool(item.get("auto_delete"))
         item["guild_name"] = item.get("guild_name") or "Discord Server"
 
-        # Pertahankan status masing-masing channel (channel baru default Paused)
         if force_status:
             item["status"] = force_status
         else:
@@ -108,15 +119,17 @@ def _merge_channel_configs(old_channels: list, new_channels: list, force_status:
         item.pop("remaining_seconds", None)
         item.pop("next_run_time", None)
 
-        if prev and item["status"] == "Running":
-            if prev.get("next_run_at"):
-                item["next_run_at"] = prev["next_run_at"]
+        if prev:
+            if prev.get("last_message_id"):
+                item["last_message_id"] = prev["last_message_id"]
             if prev.get("last_sent_at"):
                 item["last_sent_at"] = prev["last_sent_at"]
+            if item["status"] == "Running" and prev.get("next_run_at"):
+                item["next_run_at"] = prev["next_run_at"]
+            else:
+                item.pop("next_run_at", None)
         else:
             item.pop("next_run_at", None)
-            if prev and prev.get("last_sent_at"):
-                item["last_sent_at"] = prev["last_sent_at"]
 
         merged.append(item)
     return merged
@@ -137,6 +150,136 @@ def _sync_schedule_summary(sched: Schedule):
 @app.get("/", response_class=HTMLResponse)
 async def serve_dashboard(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
+
+# ENDPOINT PENGGANTI WORKER.PY UNTUK VERCEL CRON
+@app.api_route("/api/cron/tick", methods=["GET", "POST"])
+async def run_serverless_worker_tick(secret: str = "", db: Session = Depends(get_db)):
+    expected_secret = os.getenv("CRON_SECRET", "")
+    if expected_secret and secret != expected_secret:
+        raise HTTPException(status_code=401, detail="Unauthorized Cron Secret")
+
+    schedules = db.query(Schedule).all()
+    now = datetime.now()
+    processed_count = 0
+
+    for sched in schedules:
+        acct = db.query(DiscordAccount).filter(DiscordAccount.id == sched.account_id).first()
+        if not acct or not sched.target_channels:
+            continue
+
+        token = decrypt_token(acct.encrypted_token)
+        channels = [dict(c) for c in sched.target_channels]
+        changed = False
+
+        for ch in channels:
+            if ch.get("status") != "Running":
+                continue
+
+            # Batasi maksimal 4 pengiriman per tick agar tidak kena timeout 10 detik Vercel
+            if processed_count >= 4:
+                break
+
+            next_iso = ch.get("next_run_at")
+            is_due = True
+            if next_iso:
+                try:
+                    if now < datetime.fromisoformat(next_iso):
+                        is_due = False
+                except ValueError:
+                    is_due = True
+
+            if not is_due:
+                continue
+
+            ch_id = ch["id"]
+            ch_name = ch.get("name", ch_id)
+            guild_name = ch.get("guild_name", "Server")
+            label = f"#{ch_name} ({guild_name})"
+            msg_content = (ch.get("message_content") or sched.message_content or "").strip()
+            auto_delete = ch.get("auto_delete") if ch.get("auto_delete") is not None else sched.auto_delete
+            min_delay = max(15, int(ch.get("min_delay") or sched.min_delay or 1800))
+            max_delay = max(min_delay + 5, int(ch.get("max_delay") or sched.max_delay or 1830))
+
+            if not msg_content:
+                ch["status"] = "Paused"
+                ch.pop("next_run_at", None)
+                changed = True
+                continue
+
+            # 1. Hapus pesan sebelumnya jika auto_delete aktif
+            if auto_delete and ch.get("last_message_id"):
+                try:
+                    await delete_channel_message(token, ch_id, ch["last_message_id"])
+                    db.add(MessageLog(
+                        account_id=acct.id,
+                        log_type="DELETED",
+                        channel_label=label,
+                        detail="Pesan sebelumnya dihapus."
+                    ))
+                except Exception:
+                    pass
+                await asyncio.sleep(0.8)
+
+            # 2. Kirim pesan baru
+            try:
+                msg_id = await send_channel_message(token, ch_id, msg_content)
+                sent_now = datetime.now()
+                delay = random.randint(min_delay, max_delay)
+                next_time = sent_now + timedelta(seconds=delay)
+
+                ch["last_message_id"] = msg_id
+                ch["last_sent_at"] = sent_now.isoformat()
+                ch["next_run_at"] = next_time.isoformat()
+                sched.last_sent_at = sent_now
+                changed = True
+                processed_count += 1
+
+                db.add(MessageLog(
+                    account_id=acct.id,
+                    log_type="SENT",
+                    channel_label=label,
+                    detail=f"Terkirim: \"{msg_content[:45]}{'...' if len(msg_content) > 45 else ''}\""
+                ))
+                db.add(MessageLog(
+                    account_id=acct.id,
+                    log_type="SLEEP",
+                    channel_label=label,
+                    detail=f"CD {_format_duration(delay)} (kirim lagi pukul {next_time.strftime('%H:%M:%S')})."
+                ))
+
+            except DiscordRateLimitError as rl:
+                retry_time = datetime.now() + timedelta(seconds=rl.retry_after)
+                ch["next_run_at"] = retry_time.isoformat()
+                changed = True
+                processed_count += 1
+                db.add(MessageLog(
+                    account_id=acct.id,
+                    log_type="SLEEP",
+                    channel_label=label,
+                    detail=f"Slowmode Discord aktif: tunggu {_format_duration(rl.retry_after)} (kirim pukul {retry_time.strftime('%H:%M:%S')})."
+                ))
+
+            except Exception as e:
+                retry_time = datetime.now() + timedelta(seconds=60)
+                ch["next_run_at"] = retry_time.isoformat()
+                changed = True
+                processed_count += 1
+                db.add(MessageLog(
+                    account_id=acct.id,
+                    log_type="ERROR",
+                    channel_label=label,
+                    detail=str(e)
+                ))
+
+            await asyncio.sleep(0.8)
+
+        if changed:
+            sched.target_channels = channels
+            _sync_schedule_summary(sched)
+            flag_modified(sched, "target_channels")
+            db.commit()
+
+    return {"status": "ok", "processed": processed_count, "time": now.strftime("%H:%M:%S")}
 
 @app.get("/api/accounts")
 async def get_all_accounts(db: Session = Depends(get_db)):
